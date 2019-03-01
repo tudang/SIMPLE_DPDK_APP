@@ -4,7 +4,7 @@
  *   ARP and ICMP handlers.
  *   Author: Huynh Tu Dang
  */
- 
+
 #include <stdint.h>
 #include <inttypes.h>
 #include <arpa/inet.h>
@@ -53,6 +53,8 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 	struct udp_hdr *udp_hdr;
 	struct icmp_hdr *icmp_hdr;
 	int ret = 0;
+    uint32_t cksum;
+
 	char src[INET_ADDRSTRLEN];
 	char dst[INET_ADDRSTRLEN];
 
@@ -111,6 +113,12 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 							rte_eth_macaddr_get(port, &eth_hdr->s_addr);
 							ipv4_hdr->dst_addr = ipv4_hdr->src_addr;
 							ipv4_hdr->src_addr = bond_ip;
+                            cksum = ~icmp_hdr->icmp_cksum & 0xffff;
+                            cksum += ~htons(IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
+                            cksum += htons(IP_ICMP_ECHO_REPLY << 8);
+                            cksum = (cksum & 0xffff) + (cksum >> 16);
+                            cksum = (cksum & 0xffff) + (cksum >> 16);
+                            icmp_hdr->icmp_cksum = ~cksum;
 							ret = 0;
 						}
 					}
