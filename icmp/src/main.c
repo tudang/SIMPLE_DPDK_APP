@@ -45,6 +45,83 @@ static struct {
 	uint64_t total_pkts;
 } latency_numbers;
 
+static void
+swap_macs(struct ether_hdr *eth)
+{
+	struct ether_addr s_addr = eth->s_addr;
+	eth->s_addr = eth->d_addr;
+	eth->d_addr = s_addr;
+}
+
+static void
+swap_ips(struct ipv4_hdr *ipv4)
+{
+	uint32_t src_addr = ipv4->src_addr;
+	ipv4->src_addr = ipv4->dst_addr;
+	ipv4->dst_addr = src_addr;
+}
+
+static void
+swap_udp_ports(struct udp_hdr *udp)
+{
+	uint16_t src_port = udp->src_port;
+	udp->src_port = udp->dst_port;
+	udp->dst_port = src_port;
+}
+
+static int
+handle_arp(struct ether_hdr *eth_hdr, struct arp_hdr *arp_hdr, uint16_t port, uint32_t bond_ip)
+{
+	struct ether_addr d_addr;
+
+	if (arp_hdr->arp_data.arp_tip == bond_ip) {
+		if (arp_hdr->arp_op == rte_cpu_to_be_16(ARP_OP_REQUEST)) {
+			RTE_LOG(DEBUG, PAXOS, "ARP Request\n");
+			arp_hdr->arp_op = rte_cpu_to_be_16(ARP_OP_REPLY);
+			/* Switch src and dst data and set bonding MAC */
+			rte_eth_macaddr_get(port, &d_addr);
+			ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
+			ether_addr_copy(&d_addr, &eth_hdr->s_addr);
+			ether_addr_copy(&arp_hdr->arp_data.arp_sha, &arp_hdr->arp_data.arp_tha);
+			ether_addr_copy(&d_addr, &arp_hdr->arp_data.arp_sha);
+			arp_hdr->arp_data.arp_tip = arp_hdr->arp_data.arp_sip;
+			arp_hdr->arp_data.arp_sip = bond_ip;
+			return  0;
+		}
+	}
+	return -1;
+}
+
+static int
+handle_icmp(struct ether_hdr *eth_hdr, struct ipv4_hdr *ipv4_hdr, struct icmp_hdr *icmp_hdr, uint32_t bond_ip)
+{
+	uint32_t cksum;
+	if (icmp_hdr->icmp_type == IP_ICMP_ECHO_REQUEST) {
+		if (ipv4_hdr->dst_addr == bond_ip) {
+			icmp_hdr->icmp_type = IP_ICMP_ECHO_REPLY;
+			swap_macs(eth_hdr);
+			swap_ips(ipv4_hdr);
+			cksum = ~icmp_hdr->icmp_cksum & 0xffff;
+			cksum += ~htons(IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
+			cksum += htons(IP_ICMP_ECHO_REPLY << 8);
+			cksum = (cksum & 0xffff) + (cksum >> 16);
+			cksum = (cksum & 0xffff) + (cksum >> 16);
+			icmp_hdr->icmp_cksum = ~cksum;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static int
+handle_udp(struct ether_hdr *eth_hdr, struct ipv4_hdr *ipv4_hdr, struct udp_hdr *udp_hdr, uint32_t bond_ip)
+{
+	swap_macs(eth_hdr);
+	swap_ips(ipv4_hdr);
+	swap_udp_ports(udp_hdr);
+	return udp_hdr->dst_port;
+}
+
 static int
 process_packet(uint16_t port, struct rte_mbuf *pkt)
 {
@@ -52,8 +129,6 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 	struct ipv4_hdr *ipv4_hdr;
 	struct udp_hdr *udp_hdr;
 	struct icmp_hdr *icmp_hdr;
-	int ret = 0;
-    uint32_t cksum;
 
 	char src[INET_ADDRSTRLEN];
 	char dst[INET_ADDRSTRLEN];
@@ -61,80 +136,41 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 	struct ether_hdr *eth_hdr = rte_pktmbuf_mtod_offset(pkt, struct ether_hdr *, 0);
 	size_t ip_offset = sizeof(struct ether_hdr);
 
-	struct ether_addr d_addr;
 	uint32_t bond_ip = my_ip_addr.sin_addr.s_addr;
 
 	switch (rte_be_to_cpu_16(eth_hdr->ether_type)) {
 		case ETHER_TYPE_ARP:
 			arp_hdr = rte_pktmbuf_mtod_offset(pkt, struct arp_hdr *, ip_offset);
 			RTE_LOG(DEBUG, PAXOS, "src=%hx dst=%hx\n", bond_ip, arp_hdr->arp_data.arp_tip);
-
 			inet_ntop(AF_INET, &(arp_hdr->arp_data.arp_sip), src, INET_ADDRSTRLEN);
 			inet_ntop(AF_INET, &(arp_hdr->arp_data.arp_tip), dst, INET_ADDRSTRLEN);
 			RTE_LOG(DEBUG, PAXOS, "ARP: %s -> %s\n", src, dst);
-			if (arp_hdr->arp_data.arp_tip == bond_ip) {
-				if (arp_hdr->arp_op == rte_cpu_to_be_16(ARP_OP_REQUEST)) {
-					RTE_LOG(DEBUG, PAXOS, "ARP Request\n");
-					arp_hdr->arp_op = rte_cpu_to_be_16(ARP_OP_REPLY);
-					/* Switch src and dst data and set bonding MAC */
-					ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
-					rte_eth_macaddr_get(port, &eth_hdr->s_addr);
-					ether_addr_copy(&arp_hdr->arp_data.arp_sha, &arp_hdr->arp_data.arp_tha);
-					arp_hdr->arp_data.arp_tip = arp_hdr->arp_data.arp_sip;
-					rte_eth_macaddr_get(port, &d_addr);
-					ether_addr_copy(&d_addr, &arp_hdr->arp_data.arp_sha);
-					arp_hdr->arp_data.arp_sip = bond_ip;
-					ret = 0;
-				}
-			} else {
-				ret = -1;
-			}
-			break;
+			return handle_arp(eth_hdr, arp_hdr, port, bond_ip);
 		case ETHER_TYPE_IPv4:
 			ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct ipv4_hdr *, ip_offset);
 			size_t l4_offset = ip_offset + sizeof(struct ipv4_hdr);
 			inet_ntop(AF_INET, &(ipv4_hdr->src_addr), src, INET_ADDRSTRLEN);
 			inet_ntop(AF_INET, &(ipv4_hdr->dst_addr), dst, INET_ADDRSTRLEN);
-
 			RTE_LOG(DEBUG, PAXOS, "IPv4: %s -> %s\n", src, dst);
 
 			switch (ipv4_hdr->next_proto_id) {
 				case IPPROTO_UDP:
 					udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct udp_hdr *, l4_offset);
-					ret = udp_hdr->dst_port;
-					break;
+					return handle_udp(eth_hdr, ipv4_hdr, udp_hdr, bond_ip);
 				case IPPROTO_ICMP:
 					icmp_hdr = rte_pktmbuf_mtod_offset(pkt, struct icmp_hdr *, l4_offset);
 					RTE_LOG(DEBUG, PAXOS, "ICMP: %s -> %s: Type: %02x\n", src, dst, icmp_hdr->icmp_type);
-					if (icmp_hdr->icmp_type == IP_ICMP_ECHO_REQUEST) {
-						if (ipv4_hdr->dst_addr == bond_ip) {
-							icmp_hdr->icmp_type = IP_ICMP_ECHO_REPLY;
-							ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
-							rte_eth_macaddr_get(port, &eth_hdr->s_addr);
-							ipv4_hdr->dst_addr = ipv4_hdr->src_addr;
-							ipv4_hdr->src_addr = bond_ip;
-                            cksum = ~icmp_hdr->icmp_cksum & 0xffff;
-                            cksum += ~htons(IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
-                            cksum += htons(IP_ICMP_ECHO_REPLY << 8);
-                            cksum = (cksum & 0xffff) + (cksum >> 16);
-                            cksum = (cksum & 0xffff) + (cksum >> 16);
-                            icmp_hdr->icmp_cksum = ~cksum;
-							ret = 0;
-						}
-					}
-					break;
+					return handle_icmp(eth_hdr, ipv4_hdr, icmp_hdr, bond_ip);
 				default:
-					ret = -1;
 					RTE_LOG(DEBUG, PAXOS, "IP Proto: %d\n", ipv4_hdr->next_proto_id);
-					break;
+					return -1;
 			}
 			break;
 		default:
 			RTE_LOG(DEBUG, PAXOS, "Ether Proto: 0x%04x\n", rte_be_to_cpu_16(eth_hdr->ether_type));
-			ret = -1;
-			break;
+			return -1;
 	}
-	return ret;
+	return -1;
 }
 
 static uint16_t

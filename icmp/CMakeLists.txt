@@ -15,8 +15,6 @@ project (planeDB)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/")
 
-find_package (dpdk REQUIRED)
-
 include_directories(${DPDK_INCLUDE_DIR})
 
 aux_source_directory (src SRCS)
