@@ -26,11 +26,40 @@
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 
-#define NUM_MBUFS 8191
+#define NUM_MBUFS 8192
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
 
+#define MAX_PORTS 16
+
+#define	MCAST_CLONE_PORTS	4
+#define	MCAST_CLONE_SEGS	1
+
+
+#define	HDR_MBUF_DATA_SIZE	(2 * RTE_PKTMBUF_HEADROOM)
+#define	NB_HDR_MBUF	(NUM_MBUFS * MAX_PORTS)
+
+#define	NB_CLONE_MBUF (NUM_MBUFS * MCAST_CLONE_PORTS * MCAST_CLONE_SEGS * 2)
+
+
 #define RTE_LOGTYPE_PAXOS RTE_LOGTYPE_USER1
+
+#define PAXOS_PORT 12345
+struct paxos_hdr {
+	uint8_t msgtype;
+	uint8_t shard;
+    uint16_t rnd;
+    uint16_t log_index;
+    uint16_t vrnd;
+    uint16_t acptid;
+    uint16_t reserved;
+    uint32_t inst;
+    uint64_t value;
+    uint32_t request_id;
+    uint64_t igress_ts;
+} __attribute__((__packed__));
+
+static struct rte_mempool *header_pool, *clone_pool;
 
 static struct sockaddr_in my_ip_addr;
 
@@ -67,6 +96,40 @@ swap_udp_ports(struct udp_hdr *udp)
 	uint16_t src_port = udp->src_port;
 	udp->src_port = udp->dst_port;
 	udp->dst_port = src_port;
+}
+
+// static void
+// print_paxos_hdr(struct paxos_hdr *paxos_hdr) {
+//     RTE_LOG(DEBUG, PAXOS, "msgtype %u worker_id %u round %u inst %u log_index %u vrnd %u "
+//             "acptid %u reserved %u value %s request_id %u igress_ts %"PRIu64"\n",
+//                 paxos_hdr->msgtype,
+//                 paxos_hdr->shard,
+//                 rte_be_to_cpu_16(paxos_hdr->rnd),
+//                 rte_be_to_cpu_32(paxos_hdr->inst),
+//                 rte_be_to_cpu_16(paxos_hdr->log_index),
+//                 rte_be_to_cpu_16(paxos_hdr->vrnd),
+//                 rte_be_to_cpu_16(paxos_hdr->acptid),
+//                 rte_be_to_cpu_16(paxos_hdr->reserved),
+//                 (char*)&paxos_hdr->value,
+//                 rte_be_to_cpu_32(paxos_hdr->request_id),
+//                 rte_be_to_cpu_64(paxos_hdr->igress_ts));
+// }
+
+static void
+print_paxos_hdr(struct paxos_hdr *paxos_hdr) {
+    RTE_LOG(DEBUG, PAXOS, "msgtype %u worker_id %u round %u inst %u log_index %u vrnd %u "
+            "acptid %u reserved %u value %s request_id %u igress_ts %"PRIu64"\n",
+                paxos_hdr->msgtype,
+                paxos_hdr->shard,
+                (paxos_hdr->rnd),
+                (paxos_hdr->inst),
+                (paxos_hdr->log_index),
+                (paxos_hdr->vrnd),
+                (paxos_hdr->acptid),
+                (paxos_hdr->reserved),
+                (char*)&paxos_hdr->value,
+                (paxos_hdr->request_id),
+                (paxos_hdr->igress_ts));
 }
 
 static int
@@ -113,13 +176,101 @@ handle_icmp(struct ether_hdr *eth_hdr, struct ipv4_hdr *ipv4_hdr, struct icmp_hd
 	return -1;
 }
 
-static int
-handle_udp(struct ether_hdr *eth_hdr, struct ipv4_hdr *ipv4_hdr, struct udp_hdr *udp_hdr, uint32_t bond_ip)
+
+static void send_paxos_pkt(uint16_t port, struct rte_mbuf *pkt, struct ipv4_hdr *ipv4_hdr, struct udp_hdr *udp_hdr, struct paxos_hdr *paxos, uint8_t shard)
 {
+	struct paxos_hdr *px;
+	px = (struct paxos_hdr *)rte_pktmbuf_append(pkt, (uint16_t)sizeof(*px));
+	RTE_ASSERT(px != NULL);
+
+	RTE_LOG(DEBUG, PAXOS, "Shard id %2X \n", shard);
+	printf("px %p paxos %p\n", px, paxos);
+	if (px != paxos)
+	{
+		rte_memcpy(px, paxos, sizeof(*paxos));
+	}
+	px->shard = shard;
+
+	pkt->ol_flags = PKT_TX_IPV4 | PKT_TX_IP_CKSUM | PKT_TX_UDP_CKSUM;
+	udp_hdr->dgram_cksum = 0;
+	udp_hdr->dgram_cksum = rte_ipv4_phdr_cksum(ipv4_hdr, pkt->ol_flags);
+
+	const uint16_t nb_tx = rte_eth_tx_burst(port, 0, &pkt, 1);
+	if (nb_tx < 1)
+		rte_pktmbuf_free(pkt);
+}
+
+static void send_pkt(uint16_t port, struct rte_mbuf *pkt)
+{
+	const uint16_t nb_tx = rte_eth_tx_burst(port, 0, &pkt, 1);
+	if (nb_tx < 1)
+		rte_pktmbuf_free(pkt);
+}
+
+static inline struct rte_mbuf *
+mcast_out_pkt(struct rte_mbuf *pkt)
+{
+	struct rte_mbuf *cloned_paxos;
+	/* Create new mbuf for the header. */
+	if (unlikely ((cloned_paxos = rte_pktmbuf_alloc(header_pool)) == NULL)) {
+		return NULL;
+	}
+
+	if (unlikely ((pkt = rte_pktmbuf_clone(pkt, clone_pool)) == NULL)) {
+		rte_pktmbuf_free(cloned_paxos);
+		return NULL;
+	}
+	pkt->next = cloned_paxos;
+	pkt->pkt_len = (uint16_t)(pkt->data_len + cloned_paxos->pkt_len);
+	pkt->nb_segs = pkt->nb_segs + 1;
+	__rte_mbuf_sanity_check(pkt, 1);
+	return pkt;
+}
+
+static int
+handle_udp(uint8_t port, struct rte_mbuf *pkt, struct ether_hdr *eth_hdr,
+	struct ipv4_hdr *ipv4_hdr, struct udp_hdr *udp_hdr,
+	uint32_t bond_ip, size_t l4_offset)
+{
+	if (rte_be_to_cpu_16(udp_hdr->dst_port) != PAXOS_PORT)
+		return -1;
+
+	size_t paxos_offset = l4_offset + sizeof (struct udp_hdr);
 	swap_macs(eth_hdr);
 	swap_ips(ipv4_hdr);
 	swap_udp_ports(udp_hdr);
-	return udp_hdr->dst_port;
+
+	struct paxos_hdr *paxos = rte_pktmbuf_mtod_offset(pkt, struct paxos_hdr *, paxos_offset);
+	print_paxos_hdr(paxos);
+	uint8_t shard_mask = paxos->shard;
+
+	uint16_t pkt_len = pkt->pkt_len;
+	uint16_t trim_len = sizeof(*paxos);
+	if (rte_pktmbuf_trim(pkt, trim_len) < 0) {
+		RTE_LOG(WARNING, PAXOS, "Failed to trim %u bytes paxos header\n", trim_len);
+		return -1;
+	}
+
+	uint16_t pkt_len_after = pkt_len - trim_len;
+	RTE_LOG(INFO, PAXOS, "Pktlen %u -> %u\n", pkt_len, pkt_len_after);
+
+	pkt->pkt_len = pkt_len_after;
+
+	struct rte_mbuf *mc;
+	uint8_t shard;
+	for (shard=0; shard_mask != 1; shard_mask >>= 1, shard++)
+	{
+		if ((shard_mask & 1) == 0)
+			continue;
+
+		if (likely ((mc = mcast_out_pkt(pkt)) != NULL))
+			send_paxos_pkt(port, mc, ipv4_hdr, udp_hdr, paxos, shard);
+
+	}
+
+	send_paxos_pkt(port, pkt, ipv4_hdr, udp_hdr, paxos, shard);
+
+	return 0;
 }
 
 static int
@@ -145,7 +296,9 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 			inet_ntop(AF_INET, &(arp_hdr->arp_data.arp_sip), src, INET_ADDRSTRLEN);
 			inet_ntop(AF_INET, &(arp_hdr->arp_data.arp_tip), dst, INET_ADDRSTRLEN);
 			RTE_LOG(DEBUG, PAXOS, "ARP: %s -> %s\n", src, dst);
-			return handle_arp(eth_hdr, arp_hdr, port, bond_ip);
+			if (!handle_arp(eth_hdr, arp_hdr, port, bond_ip))
+				send_pkt(port, pkt);
+
 		case ETHER_TYPE_IPv4:
 			ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct ipv4_hdr *, ip_offset);
 			size_t l4_offset = ip_offset + sizeof(struct ipv4_hdr);
@@ -156,11 +309,12 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 			switch (ipv4_hdr->next_proto_id) {
 				case IPPROTO_UDP:
 					udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct udp_hdr *, l4_offset);
-					return handle_udp(eth_hdr, ipv4_hdr, udp_hdr, bond_ip);
+					return handle_udp(port, pkt, eth_hdr, ipv4_hdr, udp_hdr, bond_ip, l4_offset);
 				case IPPROTO_ICMP:
 					icmp_hdr = rte_pktmbuf_mtod_offset(pkt, struct icmp_hdr *, l4_offset);
 					RTE_LOG(DEBUG, PAXOS, "ICMP: %s -> %s: Type: %02x\n", src, dst, icmp_hdr->icmp_type);
-					return handle_icmp(eth_hdr, ipv4_hdr, icmp_hdr, bond_ip);
+					if (!handle_icmp(eth_hdr, ipv4_hdr, icmp_hdr, bond_ip))
+						send_pkt(port, pkt);
 				default:
 					RTE_LOG(DEBUG, PAXOS, "IP Proto: %d\n", ipv4_hdr->next_proto_id);
 					return -1;
@@ -238,6 +392,9 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 		port_conf.txmode.offloads |=
 			DEV_TX_OFFLOAD_MBUF_FAST_FREE;
 
+		port_conf.txmode.offloads =
+	        (DEV_TX_OFFLOAD_IPV4_CKSUM | DEV_TX_OFFLOAD_UDP_CKSUM |
+	         DEV_TX_OFFLOAD_TCP_CKSUM);
 	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
 	if (retval != 0)
 		return retval;
@@ -310,15 +467,15 @@ lcore_main(void)
 			if (unlikely(nb_rx == 0))
 				continue;
 
-			const uint16_t nb_tx = rte_eth_tx_burst(port, 0,
-					bufs, nb_rx);
-			RTE_LOG(DEBUG, PAXOS, "Sent %u packets\n", nb_tx);
-
-			if (unlikely(nb_tx < nb_rx)) {
-				uint16_t buf;
-				for (buf = nb_tx; buf < nb_rx; buf++)
-					rte_pktmbuf_free(bufs[buf]);
-			}
+			// const uint16_t nb_tx = rte_eth_tx_burst(port, 0,
+			// 		bufs, nb_rx);
+			// RTE_LOG(DEBUG, PAXOS, "Sent %u packets\n", nb_tx);
+			//
+			// if (unlikely(nb_tx < nb_rx)) {
+			// 	uint16_t buf;
+			// 	for (buf = nb_tx; buf < nb_rx; buf++)
+			// 		rte_pktmbuf_free(bufs[buf]);
+			// }
 		}
 	}
 }
@@ -428,6 +585,18 @@ main(int argc, char *argv[])
 		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (mbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+
+	header_pool = rte_pktmbuf_pool_create("header_pool", NB_HDR_MBUF, 32,
+		0, HDR_MBUF_DATA_SIZE, rte_socket_id());
+
+	if (header_pool == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot init header mbuf pool\n");
+
+	clone_pool = rte_pktmbuf_pool_create("clone_pool", NB_CLONE_MBUF, 32,
+		0, 0, rte_socket_id());
+
+	if (clone_pool == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot init clone mbuf pool\n");
 
 	/* initialize all ports */
 	RTE_ETH_FOREACH_DEV(portid)
