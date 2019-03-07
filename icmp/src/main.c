@@ -35,6 +35,8 @@
 #define	MCAST_CLONE_PORTS	4
 #define	MCAST_CLONE_SEGS	1
 
+#define MAX_PKT_BURST 8
+#define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 
 #define	HDR_MBUF_DATA_SIZE	(2 * RTE_PKTMBUF_HEADROOM)
 #define	NB_HDR_MBUF	(NUM_MBUFS * MAX_PORTS)
@@ -58,6 +60,20 @@ struct paxos_hdr {
     uint32_t request_id;
     uint64_t igress_ts;
 } __attribute__((__packed__));
+
+struct mbuf_table {
+	uint16_t len;
+	struct rte_mbuf *m_table[MAX_PKT_BURST];
+};
+
+struct lcore_queue_conf {
+	uint64_t tx_tsc;
+	uint8_t rx_queue;
+	uint16_t tx_queue_id;
+	struct mbuf_table tx_mbufs;
+} __rte_cache_aligned;
+static struct lcore_queue_conf lcore_queue_conf;
+
 
 static struct rte_mempool *header_pool, *clone_pool;
 
@@ -176,17 +192,43 @@ handle_icmp(struct ether_hdr *eth_hdr, struct ipv4_hdr *ipv4_hdr, struct icmp_hd
 	return -1;
 }
 
+/* Send burst of packets on an output interface */
+static void
+send_burst(struct lcore_queue_conf *qconf, uint16_t port)
+{
+	struct rte_mbuf **m_table;
+	uint16_t n, queueid;
+	int ret;
 
-static void send_paxos_pkt(uint16_t port, struct rte_mbuf *pkt, struct ipv4_hdr *ipv4_hdr, struct udp_hdr *udp_hdr, struct paxos_hdr *paxos, uint8_t shard)
+	queueid = qconf->tx_queue_id;
+	m_table = (struct rte_mbuf **)qconf->tx_mbufs.m_table;
+	n = qconf->tx_mbufs.len;
+
+	uint16_t i;
+	for (i=0; i < n; i++) {
+		RTE_LOG(DEBUG, PAXOS, "Packet %u Refcnt %u\n", i, rte_mbuf_refcnt_read(m_table[i]));
+	}
+	rte_mbuf_refcnt_set(m_table[n-1], 1);
+	ret = rte_eth_tx_burst(port, queueid, m_table, n);
+	RTE_LOG(DEBUG, PAXOS, "Request %d. SENT burst %d packets\n", n, ret);
+	while (unlikely (ret < n)) {
+		rte_pktmbuf_free(m_table[ret]);
+		ret++;
+	}
+
+	qconf->tx_mbufs.len = 0;
+}
+
+static void
+send_paxos_pkt(struct lcore_queue_conf *qconf, uint16_t port, struct rte_mbuf *pkt,
+			struct ipv4_hdr *ipv4_hdr, struct udp_hdr *udp_hdr,
+			struct paxos_hdr *paxos, uint8_t shard)
 {
 	struct paxos_hdr *px;
 	px = (struct paxos_hdr *)rte_pktmbuf_append(pkt, (uint16_t)sizeof(*px));
 	RTE_ASSERT(px != NULL);
 
-	RTE_LOG(DEBUG, PAXOS, "Shard id %2X \n", shard);
-	printf("px %p paxos %p\n", px, paxos);
-	if (px != paxos)
-	{
+	if (px != paxos) {
 		rte_memcpy(px, paxos, sizeof(*paxos));
 	}
 	px->shard = shard;
@@ -195,16 +237,25 @@ static void send_paxos_pkt(uint16_t port, struct rte_mbuf *pkt, struct ipv4_hdr 
 	udp_hdr->dgram_cksum = 0;
 	udp_hdr->dgram_cksum = rte_ipv4_phdr_cksum(ipv4_hdr, pkt->ol_flags);
 
-	const uint16_t nb_tx = rte_eth_tx_burst(port, 0, &pkt, 1);
-	if (nb_tx < 1)
-		rte_pktmbuf_free(pkt);
+
+	uint32_t len = qconf->tx_mbufs.len;
+	qconf->tx_mbufs.m_table[len] = pkt;
+	qconf->tx_mbufs.len = ++len;
+
+	if (unlikely(MAX_PKT_BURST == len))
+		send_burst(qconf, port);
 }
 
-static void send_pkt(uint16_t port, struct rte_mbuf *pkt)
+
+static void
+send_pkt(struct lcore_queue_conf *qconf, uint16_t port, struct rte_mbuf *pkt)
 {
-	const uint16_t nb_tx = rte_eth_tx_burst(port, 0, &pkt, 1);
-	if (nb_tx < 1)
-		rte_pktmbuf_free(pkt);
+	uint32_t len = qconf->tx_mbufs.len;
+	qconf->tx_mbufs.m_table[len] = pkt;
+	qconf->tx_mbufs.len = ++len;
+
+	if (unlikely(MAX_PKT_BURST == len))
+		send_burst(qconf, port);
 }
 
 static inline struct rte_mbuf *
@@ -220,16 +271,17 @@ mcast_out_pkt(struct rte_mbuf *pkt)
 		rte_pktmbuf_free(cloned_paxos);
 		return NULL;
 	}
+
 	pkt->next = cloned_paxos;
-	pkt->pkt_len = (uint16_t)(pkt->data_len + cloned_paxos->pkt_len);
-	pkt->nb_segs = pkt->nb_segs + 1;
 	__rte_mbuf_sanity_check(pkt, 1);
+
+
 	return pkt;
 }
 
 static int
-handle_udp(uint8_t port, struct rte_mbuf *pkt, struct ether_hdr *eth_hdr,
-	struct ipv4_hdr *ipv4_hdr, struct udp_hdr *udp_hdr,
+handle_udp(struct lcore_queue_conf *qconf, uint8_t port, struct rte_mbuf *pkt,
+	struct ether_hdr *eth_hdr, struct ipv4_hdr *ipv4_hdr, struct udp_hdr *udp_hdr,
 	uint32_t bond_ip, size_t l4_offset)
 {
 	if (rte_be_to_cpu_16(udp_hdr->dst_port) != PAXOS_PORT)
@@ -241,40 +293,34 @@ handle_udp(uint8_t port, struct rte_mbuf *pkt, struct ether_hdr *eth_hdr,
 	swap_udp_ports(udp_hdr);
 
 	struct paxos_hdr *paxos = rte_pktmbuf_mtod_offset(pkt, struct paxos_hdr *, paxos_offset);
-	print_paxos_hdr(paxos);
 	uint8_t shard_mask = paxos->shard;
 
-	uint16_t pkt_len = pkt->pkt_len;
 	uint16_t trim_len = sizeof(*paxos);
 	if (rte_pktmbuf_trim(pkt, trim_len) < 0) {
 		RTE_LOG(WARNING, PAXOS, "Failed to trim %u bytes paxos header\n", trim_len);
 		return -1;
 	}
 
-	uint16_t pkt_len_after = pkt_len - trim_len;
-	RTE_LOG(INFO, PAXOS, "Pktlen %u -> %u\n", pkt_len, pkt_len_after);
-
-	pkt->pkt_len = pkt_len_after;
-
-	struct rte_mbuf *mc;
 	uint8_t shard;
 	for (shard=0; shard_mask != 1; shard_mask >>= 1, shard++)
 	{
 		if ((shard_mask & 1) == 0)
 			continue;
 
+		struct rte_mbuf *mc;
+
 		if (likely ((mc = mcast_out_pkt(pkt)) != NULL))
-			send_paxos_pkt(port, mc, ipv4_hdr, udp_hdr, paxos, shard);
+			send_paxos_pkt(qconf, port, mc, ipv4_hdr, udp_hdr, paxos, shard);
 
 	}
 
-	send_paxos_pkt(port, pkt, ipv4_hdr, udp_hdr, paxos, shard);
+	send_paxos_pkt(qconf, port, pkt, ipv4_hdr, udp_hdr, paxos, shard);
 
 	return 0;
 }
 
 static int
-process_packet(uint16_t port, struct rte_mbuf *pkt)
+process_packet(struct lcore_queue_conf *qconf, uint16_t port, struct rte_mbuf *pkt)
 {
 	struct arp_hdr *arp_hdr;
 	struct ipv4_hdr *ipv4_hdr;
@@ -297,7 +343,7 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 			inet_ntop(AF_INET, &(arp_hdr->arp_data.arp_tip), dst, INET_ADDRSTRLEN);
 			RTE_LOG(DEBUG, PAXOS, "ARP: %s -> %s\n", src, dst);
 			if (!handle_arp(eth_hdr, arp_hdr, port, bond_ip))
-				send_pkt(port, pkt);
+				send_pkt(qconf, port, pkt);
 
 		case ETHER_TYPE_IPv4:
 			ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct ipv4_hdr *, ip_offset);
@@ -309,12 +355,12 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 			switch (ipv4_hdr->next_proto_id) {
 				case IPPROTO_UDP:
 					udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct udp_hdr *, l4_offset);
-					return handle_udp(port, pkt, eth_hdr, ipv4_hdr, udp_hdr, bond_ip, l4_offset);
+					return handle_udp(qconf, port, pkt, eth_hdr, ipv4_hdr, udp_hdr, bond_ip, l4_offset);
 				case IPPROTO_ICMP:
 					icmp_hdr = rte_pktmbuf_mtod_offset(pkt, struct icmp_hdr *, l4_offset);
 					RTE_LOG(DEBUG, PAXOS, "ICMP: %s -> %s: Type: %02x\n", src, dst, icmp_hdr->icmp_type);
 					if (!handle_icmp(eth_hdr, ipv4_hdr, icmp_hdr, bond_ip))
-						send_pkt(port, pkt);
+						send_pkt(qconf, port, pkt);
 				default:
 					RTE_LOG(DEBUG, PAXOS, "IP Proto: %d\n", ipv4_hdr->next_proto_id);
 					return -1;
@@ -330,15 +376,16 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 static uint16_t
 add_timestamps(uint16_t port __rte_unused, uint16_t qidx __rte_unused,
 		struct rte_mbuf **pkts, uint16_t nb_pkts,
-		uint16_t max_pkts __rte_unused, void *_ __rte_unused)
+		uint16_t max_pkts __rte_unused, void *arg)
 {
+	struct lcore_queue_conf *qconf = arg;
 	unsigned i;
 	int ret = 0;
 	uint64_t now = rte_rdtsc();
 	uint16_t nb_rx = nb_pkts;
 	for (i = 0; i < nb_rx; i++) {
 		pkts[i]->udata64 = now;
-		ret = process_packet(port, pkts[i]);
+		ret = process_packet(qconf, port, pkts[i]);
 		if (ret < 0) {
 			rte_pktmbuf_free(pkts[i]);
 			nb_pkts--;
@@ -375,6 +422,7 @@ calc_latency(uint16_t port __rte_unused, uint16_t qidx __rte_unused,
 static inline int
 port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 {
+	struct lcore_queue_conf *qconf;
 	struct rte_eth_conf port_conf = port_conf_default;
 	const uint16_t rx_rings = 1, tx_rings = 1;
 	uint16_t nb_rxd = RX_RING_SIZE;
@@ -386,6 +434,9 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 
 	if (!rte_eth_dev_is_valid_port(port))
 		return -1;
+
+	qconf = &lcore_queue_conf;
+	qconf->rx_queue = port;
 
 	rte_eth_dev_info_get(port, &dev_info);
 	if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE)
@@ -419,6 +470,8 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 			return retval;
 	}
 
+	qconf->tx_queue_id = 0;
+
 	retval  = rte_eth_dev_start(port);
 	if (retval < 0)
 		return retval;
@@ -434,11 +487,31 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 			addr.addr_bytes[4], addr.addr_bytes[5]);
 
 	rte_eth_promiscuous_enable(port);
-	rte_eth_add_rx_callback(port, 0, add_timestamps, NULL);
+	rte_eth_add_rx_callback(port, 0, add_timestamps, qconf);
 	rte_eth_add_tx_callback(port, 0, calc_latency, NULL);
 
 	return 0;
 }
+
+/* Send burst of outgoing packet, if timeout expires. */
+static inline void
+send_timeout_burst(struct lcore_queue_conf *qconf)
+{
+	uint64_t cur_tsc;
+	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
+
+	cur_tsc = rte_rdtsc();
+	if (likely (cur_tsc < qconf->tx_tsc + drain_tsc))
+		return;
+
+	if (qconf->tx_mbufs.len != 0) {
+		RTE_LOG(INFO, PAXOS, "Timeout flush\n");
+		send_burst(qconf, qconf->tx_queue_id);
+	}
+
+	qconf->tx_tsc = cur_tsc;
+}
+
 
 /*
  * Main thread that does the work, reading from INPUT_PORT
@@ -462,20 +535,8 @@ lcore_main(void)
 	for (;;) {
 		RTE_ETH_FOREACH_DEV(port) {
 			struct rte_mbuf *bufs[BURST_SIZE];
-			const uint16_t nb_rx = rte_eth_rx_burst(port, 0,
-					bufs, BURST_SIZE);
-			if (unlikely(nb_rx == 0))
-				continue;
-
-			// const uint16_t nb_tx = rte_eth_tx_burst(port, 0,
-			// 		bufs, nb_rx);
-			// RTE_LOG(DEBUG, PAXOS, "Sent %u packets\n", nb_tx);
-			//
-			// if (unlikely(nb_tx < nb_rx)) {
-			// 	uint16_t buf;
-			// 	for (buf = nb_tx; buf < nb_rx; buf++)
-			// 		rte_pktmbuf_free(bufs[buf]);
-			// }
+			rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
+			send_timeout_burst(&lcore_queue_conf);
 		}
 	}
 }
