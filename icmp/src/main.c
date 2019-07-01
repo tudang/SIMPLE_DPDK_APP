@@ -101,7 +101,12 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 			switch (ipv4_hdr->next_proto_id) {
 				case IPPROTO_UDP:
 					udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct udp_hdr *, l4_offset);
-					ret = udp_hdr->dst_port;
+					// TODO: Swap IP addresses
+					// Your code here
+
+					// TODO: Swap UDP ports
+					// Your code here
+					ret = 0;
 					break;
 				case IPPROTO_ICMP:
 					icmp_hdr = rte_pktmbuf_mtod_offset(pkt, struct icmp_hdr *, l4_offset);
