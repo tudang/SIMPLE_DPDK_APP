@@ -36,7 +36,7 @@ static struct sockaddr_in my_ip_addr;
 
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = {
-		.max_rx_pkt_len = ETHER_MAX_LEN,
+		.max_rx_pkt_len = RTE_ETHER_MAX_LEN,
 	},
 };
 
@@ -48,41 +48,41 @@ static struct {
 static int
 process_packet(uint16_t port, struct rte_mbuf *pkt)
 {
-	struct arp_hdr *arp_hdr;
-	struct ipv4_hdr *ipv4_hdr;
-	struct udp_hdr *udp_hdr;
-	struct icmp_hdr *icmp_hdr;
+	struct rte_arp_hdr *arp_hdr;
+	struct rte_ipv4_hdr *ipv4_hdr;
+	struct rte_udp_hdr *udp_hdr;
+	struct rte_icmp_hdr *icmp_hdr;
 	int ret = 0;
-    uint32_t cksum;
+  uint32_t cksum;
 
 	char src[INET_ADDRSTRLEN];
 	char dst[INET_ADDRSTRLEN];
 
-	struct ether_hdr *eth_hdr = rte_pktmbuf_mtod_offset(pkt, struct ether_hdr *, 0);
-	size_t ip_offset = sizeof(struct ether_hdr);
+	struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ether_hdr *, 0);
+	size_t ip_offset = sizeof(struct rte_ether_hdr);
 
-	struct ether_addr d_addr;
+	struct rte_ether_addr d_addr;
 	uint32_t bond_ip = my_ip_addr.sin_addr.s_addr;
 
 	switch (rte_be_to_cpu_16(eth_hdr->ether_type)) {
-		case ETHER_TYPE_ARP:
-			arp_hdr = rte_pktmbuf_mtod_offset(pkt, struct arp_hdr *, ip_offset);
+		case RTE_ETHER_TYPE_ARP:
+			arp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_arp_hdr *, ip_offset);
 			RTE_LOG(DEBUG, PAXOS, "src=%hx dst=%hx\n", bond_ip, arp_hdr->arp_data.arp_tip);
 
 			inet_ntop(AF_INET, &(arp_hdr->arp_data.arp_sip), src, INET_ADDRSTRLEN);
 			inet_ntop(AF_INET, &(arp_hdr->arp_data.arp_tip), dst, INET_ADDRSTRLEN);
 			RTE_LOG(DEBUG, PAXOS, "ARP: %s -> %s\n", src, dst);
 			if (arp_hdr->arp_data.arp_tip == bond_ip) {
-				if (arp_hdr->arp_op == rte_cpu_to_be_16(ARP_OP_REQUEST)) {
+				if (arp_hdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
 					RTE_LOG(DEBUG, PAXOS, "ARP Request\n");
-					arp_hdr->arp_op = rte_cpu_to_be_16(ARP_OP_REPLY);
+					arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
 					/* Switch src and dst data and set bonding MAC */
-					ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
+					rte_ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
 					rte_eth_macaddr_get(port, &eth_hdr->s_addr);
-					ether_addr_copy(&arp_hdr->arp_data.arp_sha, &arp_hdr->arp_data.arp_tha);
+					rte_ether_addr_copy(&arp_hdr->arp_data.arp_sha, &arp_hdr->arp_data.arp_tha);
 					arp_hdr->arp_data.arp_tip = arp_hdr->arp_data.arp_sip;
 					rte_eth_macaddr_get(port, &d_addr);
-					ether_addr_copy(&d_addr, &arp_hdr->arp_data.arp_sha);
+					rte_ether_addr_copy(&d_addr, &arp_hdr->arp_data.arp_sha);
 					arp_hdr->arp_data.arp_sip = bond_ip;
 					ret = 0;
 				}
@@ -90,9 +90,9 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 				ret = -1;
 			}
 			break;
-		case ETHER_TYPE_IPv4:
-			ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct ipv4_hdr *, ip_offset);
-			size_t l4_offset = ip_offset + sizeof(struct ipv4_hdr);
+		case RTE_ETHER_TYPE_IPV4:
+			ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, ip_offset);
+			size_t l4_offset = ip_offset + sizeof(struct rte_ipv4_hdr);
 			inet_ntop(AF_INET, &(ipv4_hdr->src_addr), src, INET_ADDRSTRLEN);
 			inet_ntop(AF_INET, &(ipv4_hdr->dst_addr), dst, INET_ADDRSTRLEN);
 
@@ -100,27 +100,22 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 
 			switch (ipv4_hdr->next_proto_id) {
 				case IPPROTO_UDP:
-					udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct udp_hdr *, l4_offset);
-					// TODO: Swap IP addresses
-					// Your code here
-
-					// TODO: Swap UDP ports
-					// Your code here
-					ret = 0;
+					udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *, l4_offset);
+					ret = udp_hdr->dst_port;
 					break;
 				case IPPROTO_ICMP:
-					icmp_hdr = rte_pktmbuf_mtod_offset(pkt, struct icmp_hdr *, l4_offset);
+					icmp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_icmp_hdr *, l4_offset);
 					RTE_LOG(DEBUG, PAXOS, "ICMP: %s -> %s: Type: %02x\n", src, dst, icmp_hdr->icmp_type);
-					if (icmp_hdr->icmp_type == IP_ICMP_ECHO_REQUEST) {
+					if (icmp_hdr->icmp_type == RTE_IP_ICMP_ECHO_REQUEST) {
 						if (ipv4_hdr->dst_addr == bond_ip) {
-							icmp_hdr->icmp_type = IP_ICMP_ECHO_REPLY;
-							ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
+							icmp_hdr->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
+							rte_ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
 							rte_eth_macaddr_get(port, &eth_hdr->s_addr);
 							ipv4_hdr->dst_addr = ipv4_hdr->src_addr;
 							ipv4_hdr->src_addr = bond_ip;
                             cksum = ~icmp_hdr->icmp_cksum & 0xffff;
-                            cksum += ~htons(IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
-                            cksum += htons(IP_ICMP_ECHO_REPLY << 8);
+                            cksum += ~htons(RTE_IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
+                            cksum += htons(RTE_IP_ICMP_ECHO_REPLY << 8);
                             cksum = (cksum & 0xffff) + (cksum >> 16);
                             cksum = (cksum & 0xffff) + (cksum >> 16);
                             icmp_hdr->icmp_cksum = ~cksum;
@@ -235,7 +230,7 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 	if (retval < 0)
 		return retval;
 
-	struct ether_addr addr;
+	struct rte_ether_addr addr;
 
 	rte_eth_macaddr_get(port, &addr);
 	printf("Port %u MAC: %02"PRIx8" %02"PRIx8" %02"PRIx8

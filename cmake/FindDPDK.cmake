@@ -1,4 +1,4 @@
-# Try to find dpdk v18.08
+# Try to find dpdk v19.08
 #
 # Once done, this will define
 #
@@ -11,19 +11,26 @@ find_path(DPDK_INCLUDE_DIR rte_config.h
   HINTS $ENV{RTE_SDK}/$ENV{RTE_TARGET}/include)
 
 set(components
-    acl bbdev bitratestats bpf bus_dpaa bus_fslmc bus_ifpga bus_pci bus_vdev cfgfile cmdline
-     compressdev cryptodev distributor eal efd ethdev eventdev
-    flow_classify gro gso hash ip_frag jobstats kni kvargs latencystats stack
-    lpm mbuf member mempool mempool_bucket mempool_dpaa2 mempool_dpaa common_dpaax
-    mempool_ring mempool_stack meter metrics net pci pdump pipeline pmd_af_packet
-    pmd_ark pmd_avp pmd_axgbe pmd_bbdev_null pmd_bnxt pmd_bond pmd_crypto_scheduler
-    pmd_cxgbe pmd_dpaa2 pmd_dpaa2_cmdif pmd_dpaa2_event pmd_dpaa2_qdma pmd_dpaa2_sec
-    pmd_dpaa pmd_dpaa_event pmd_dpaa_sec pmd_e1000 pmd_ena pmd_enic pmd_failsafe pmd_fm10k
-    pmd_i40e pmd_ifpga_rawdev pmd_ixgbe pmd_kni pmd_lio pmd_nfp pmd_null
-    pmd_null_crypto   pmd_opdl_event pmd_qede pmd_ring
-    pmd_sfc_efx pmd_skeleton_event pmd_skeleton_rawdev pmd_softnic pmd_sw_event
-    pmd_tap pmd_thunderx_nicvf pmd_vdev_netvsc pmd_vhost pmd_virtio pmd_virtio_crypto
-    pmd_vmxnet3_uio port power rawdev reorder ring sched security table timer vhost)
+    acl bbdev bitratestats bpf bus_dpaa bus_fslmc bus_ifpga bus_pci bus_vdev
+    bus_vmbus cfgfile cmdline common_cpt common_dpaax common_octeontx2
+    common_octeontx compressdev cryptodev distributor eal efd ethdev eventdev
+    flow_classify gro gso hash ip_frag ipsec jobstats kni kvargs latencystats
+    lpm mbuf member mempool mempool_bucket mempool_dpaa2 mempool_dpaa
+    mempool_octeontx2 mempool_octeontx mempool_ring mempool_stack meter metrics
+    net pci pdump pipeline pmd_af_packet pmd_ark pmd_atlantic pmd_avp pmd_axgbe
+    pmd_bbdev_null pmd_bbdev_turbo_sw pmd_bnxt pmd_bond pmd_caam_jr
+    pmd_crypto_scheduler pmd_cxgbe pmd_dpaa2 pmd_dpaa2_event pmd_dpaa2_sec
+    pmd_dpaa pmd_dpaa_event pmd_dpaa_sec pmd_dsw_event pmd_e1000 pmd_ena
+    pmd_enetc pmd_enic pmd_failsafe pmd_fm10k pmd_fpga_lte_fec pmd_hinic
+    pmd_i40e pmd_iavf pmd_ice pmd_ifc pmd_ipn3ke pmd_ixgbe pmd_kni pmd_lio
+    pmd_memif pmd_netvsc pmd_nfp pmd_null pmd_null_crypto pmd_octeontx2
+    pmd_octeontx2_event pmd_octeontx pmd_octeontx_crypto pmd_octeontx_ssovf
+    pmd_octeontx_zip pmd_opdl_event pmd_qat pmd_qede pmd_ring pmd_sfc_efx
+    pmd_skeleton_event pmd_softnic pmd_sw_event pmd_tap pmd_thunderx_nicvf
+    pmd_vdev_netvsc pmd_vhost pmd_virtio pmd_virtio_crypto pmd_vmxnet3_uio port
+    power rawdev rawdev_dpaa2_cmdif rawdev_dpaa2_qdma rawdev_ifpga rawdev_ioat
+    rawdev_ntb rawdev_octeontx2_dma rawdev_skeleton rcu reorder ring sched
+    security stack table timer vhost )
 
 foreach(c ${components})
   find_library(DPDK_rte_${c}_LIBRARY rte_${c}
