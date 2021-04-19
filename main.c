@@ -34,6 +34,16 @@
 
 static struct sockaddr_in my_ip_addr;
 
+typedef uint64_t tsc_t;
+
+static int tsc_dynfield_offset = -1;
+
+static inline tsc_t *
+tsc_field(struct rte_mbuf *mbuf)
+{
+	return RTE_MBUF_DYNFIELD(mbuf, tsc_dynfield_offset, tsc_t *);
+}
+
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = {
 		.max_rx_pkt_len = RTE_ETHER_MAX_LEN,
@@ -53,13 +63,17 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 	struct rte_udp_hdr *udp_hdr;
 	struct rte_icmp_hdr *icmp_hdr;
 	int ret = 0;
-  uint32_t cksum;
+	uint32_t cksum;
 
 	char src[INET_ADDRSTRLEN];
 	char dst[INET_ADDRSTRLEN];
 
 	struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ether_hdr *, 0);
 	size_t ip_offset = sizeof(struct rte_ether_hdr);
+
+	/* Switch src and dst data and set bonding MAC */
+	rte_ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
+	rte_eth_macaddr_get(port, &eth_hdr->s_addr);
 
 	struct rte_ether_addr d_addr;
 	uint32_t bond_ip = my_ip_addr.sin_addr.s_addr;
@@ -76,9 +90,6 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 				if (arp_hdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
 					RTE_LOG(DEBUG, PAXOS, "ARP Request\n");
 					arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
-					/* Switch src and dst data and set bonding MAC */
-					rte_ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
-					rte_eth_macaddr_get(port, &eth_hdr->s_addr);
 					rte_ether_addr_copy(&arp_hdr->arp_data.arp_sha, &arp_hdr->arp_data.arp_tha);
 					arp_hdr->arp_data.arp_tip = arp_hdr->arp_data.arp_sip;
 					rte_eth_macaddr_get(port, &d_addr);
@@ -97,30 +108,35 @@ process_packet(uint16_t port, struct rte_mbuf *pkt)
 			inet_ntop(AF_INET, &(ipv4_hdr->dst_addr), dst, INET_ADDRSTRLEN);
 
 			RTE_LOG(DEBUG, PAXOS, "IPv4: %s -> %s\n", src, dst);
+			RTE_LOG(DEBUG, PAXOS, "dst %d -> ntohl(dst) %d -> bond_ip %d\n", ipv4_hdr->dst_addr, ntohl(ipv4_hdr->dst_addr), bond_ip);
+
+			if (ipv4_hdr->dst_addr != bond_ip)
+				return -1;
+
+			ipv4_hdr->dst_addr = ipv4_hdr->src_addr;
+			ipv4_hdr->src_addr = bond_ip;
 
 			switch (ipv4_hdr->next_proto_id) {
 				case IPPROTO_UDP:
 					udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *, l4_offset);
-					ret = udp_hdr->dst_port;
+					RTE_LOG(DEBUG, PAXOS, "UDP: %d -> %d\n", ntohs(udp_hdr->src_port), ntohs(udp_hdr->dst_port));
+					uint16_t dst_port = udp_hdr->dst_port;
+					udp_hdr->dst_port = udp_hdr->src_port;
+					udp_hdr->src_port = dst_port;
+					ret = 0;
 					break;
 				case IPPROTO_ICMP:
 					icmp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_icmp_hdr *, l4_offset);
 					RTE_LOG(DEBUG, PAXOS, "ICMP: %s -> %s: Type: %02x\n", src, dst, icmp_hdr->icmp_type);
 					if (icmp_hdr->icmp_type == RTE_IP_ICMP_ECHO_REQUEST) {
-						if (ipv4_hdr->dst_addr == bond_ip) {
 							icmp_hdr->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
-							rte_ether_addr_copy(&eth_hdr->s_addr, &eth_hdr->d_addr);
-							rte_eth_macaddr_get(port, &eth_hdr->s_addr);
-							ipv4_hdr->dst_addr = ipv4_hdr->src_addr;
-							ipv4_hdr->src_addr = bond_ip;
-                            cksum = ~icmp_hdr->icmp_cksum & 0xffff;
-                            cksum += ~htons(RTE_IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
-                            cksum += htons(RTE_IP_ICMP_ECHO_REPLY << 8);
-                            cksum = (cksum & 0xffff) + (cksum >> 16);
-                            cksum = (cksum & 0xffff) + (cksum >> 16);
-                            icmp_hdr->icmp_cksum = ~cksum;
+				                        cksum = ~icmp_hdr->icmp_cksum & 0xffff;
+				                        cksum += ~htons(RTE_IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
+                            				cksum += htons(RTE_IP_ICMP_ECHO_REPLY << 8);
+				                        cksum = (cksum & 0xffff) + (cksum >> 16);
+				                        cksum = (cksum & 0xffff) + (cksum >> 16);
+				                        icmp_hdr->icmp_cksum = ~cksum;
 							ret = 0;
-						}
 					}
 					break;
 				default:
@@ -147,7 +163,7 @@ add_timestamps(uint16_t port __rte_unused, uint16_t qidx __rte_unused,
 	uint64_t now = rte_rdtsc();
 	uint16_t nb_rx = nb_pkts;
 	for (i = 0; i < nb_rx; i++) {
-		pkts[i]->udata64 = now;
+		*tsc_field(pkts[i]) = now;
 		ret = process_packet(port, pkts[i]);
 		if (ret < 0) {
 			rte_pktmbuf_free(pkts[i]);
@@ -166,7 +182,7 @@ calc_latency(uint16_t port __rte_unused, uint16_t qidx __rte_unused,
 	unsigned i;
 
 	for (i = 0; i < nb_pkts; i++)
-		cycles += now - pkts[i]->udata64;
+		cycles += now - *tsc_field(pkts[i]);
 	latency_numbers.total_cycles += cycles;
 	latency_numbers.total_pkts += nb_pkts;
 
@@ -298,6 +314,7 @@ parse_arg_ip_address(const char *arg, struct sockaddr_in *addr)
     if (token != NULL) {
         ret = inet_pton(AF_INET, token, &addr->sin_addr);
         if (ret == 0 || ret < 0) {
+		RTE_LOG(DEBUG, PAXOS, "inet_pton\n");
             return -1;
         }
     }
@@ -308,8 +325,10 @@ parse_arg_ip_address(const char *arg, struct sockaddr_in *addr)
         errno = 0;
         x = strtoul(token, &endpt, 10);
         if (errno != 0 || endpt == arg || *endpt != '\0') {
+		RTE_LOG(DEBUG, PAXOS, "strtoul\n");
           return -2;
         }
+	RTE_LOG(DEBUG, PAXOS, "PORT %d\n", x);
         addr->sin_port = htons(x);
     }
 
@@ -337,6 +356,7 @@ int app_parse_args(int argc, char **argv)
 			case 0:
 				if (!strcmp(lgopts[option_index].name, "src")) {
 					argc_src = 1;
+					printf("Parsing IP address\n");
 					ret = parse_arg_ip_address(optarg, &my_ip_addr);
 					if (ret) {
 						printf("Incorrect value for --src argument (%d)\n", ret);
@@ -383,6 +403,11 @@ main(int argc, char *argv[])
 
 	rte_log_set_level(RTE_LOGTYPE_PAXOS, rte_log_get_global_level());
 
+	static const struct rte_mbuf_dynfield tsc_dynfield_desc = {
+		.name = "example_bbdev_dynfield_tsc",
+		.size = sizeof(tsc_t),
+		.align = __alignof__(tsc_t),
+	};
 	nb_ports = rte_eth_dev_count_avail();
 	if (nb_ports < 1)
 		rte_exit(EXIT_FAILURE, "Error: number of ports must be greater than 0\n");
@@ -392,6 +417,9 @@ main(int argc, char *argv[])
 		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (mbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+
+	tsc_dynfield_offset =
+		rte_mbuf_dynfield_register(&tsc_dynfield_desc);
 
 	/* initialize all ports */
 	RTE_ETH_FOREACH_DEV(portid)

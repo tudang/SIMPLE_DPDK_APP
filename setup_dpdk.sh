@@ -7,19 +7,13 @@ if [ "$EUID" -ne 0 ] ;  then
 	exit -1
 fi
 
-if [ -z ${RTE_SDK} ]; then
-	echo "Please set \$RTE_SDK variable"
-	echo "sudo -E ./setup.sh"
-	exit -1
-fi
+modprobe uio_pci_generic
+dpdk-devbind.py --status
 
-modprobe uio
-sudo insmod $RTE_SDK/$RTE_TARGET/kmod/igb_uio.ko
-$RTE_SDK/usertools/dpdk-devbind.py --status
-
-sudo mkdir -p /mnt/huge
-sudo mount -t hugetlbfs nodev /mnt/huge/
+mkdir -p /mnt/huge
+mount -t hugetlbfs nodev /mnt/huge/
 echo 512 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+echo 512 > /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
 
-$RTE_SDK/usertools/dpdk-devbind.py --bind=igb_uio 00:08.0
-$RTE_SDK/usertools/dpdk-devbind.py --status
+dpdk-devbind.py --bind=uio_pci_generic 86:00.0
+dpdk-devbind.py --status

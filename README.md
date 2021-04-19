@@ -2,33 +2,37 @@
 
 ```
 git clone https://github.com/tudang/SIMPLE_DPDK_APP.git $HOME/SIMPLE_DPDK_APP
-mkdir -p $HOME/build/SIMPLE_DPDK_APP
-cd $HOME/build/SIMPLE_DPDK_APP
 cmake $HOME/SIMPLE_DPDK_APP
-make
+meson build
+ninja -C build
 ```
+
+# Setup for DPDK
+The PCI address of NIC intented to run the DPDK program is 86:00.0. 
+Use `setup_dpdk.sh` as a reference.
+
 
 # Run SIMPLE_DPDK_APP
 
-node96:
+node6:
 
 ```
-sudo $HOME/build/icmp/main 192.168.4.96:12345
+sudo $HOME/build/ping_dpdk 192.168.50.6:12345
 ```
 
 
-node95:
+node5:
 
 configure IP address
 
 ```
-sudo ifconfig eth2 192.168.4.95
+sudo ifconfig eth2 192.168.50.5
 ```
 
 Try `ping`
 
 ```
-ping 192.168.4.96
+ping 192.168.50.6
 ```
 
 Try simple Python client
@@ -37,7 +41,7 @@ Try simple Python client
 # File udp_client.py
 import socket
 
-UDP_IP = "192.168.4.96"
+UDP_IP = "192.168.50.6"
 UDP_PORT = 12345
 MESSAGE = "Hello, World!"
 
